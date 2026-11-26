@@ -6,7 +6,9 @@ may change the matched prefix but may not change the promised egress name.
 Actual UDP datagrams are sent only by ``dispatch_next``.
 """
 
+from array import array
 from dataclasses import dataclass
+from functools import lru_cache
 from ipaddress import IPv4Address, IPv4Network
 import socket
 import threading
@@ -18,6 +20,12 @@ MAX_ACTIVE_SAMPLES = 64
 # Short aliases for callers/tests using the specification's limit names.
 MAX_BATCH = MAX_BATCH_SIZE
 MAX_SAMPLES = MAX_ACTIVE_SAMPLES
+
+# Offload compiler scale limits.
+MAX_OFFLOAD_ROUTES = 4096
+MAX_OFFLOAD_RANGES = 4096
+MAX_OFFLOAD_EGRESSES = 32
+MAX_OFFLOAD_ROWS = 8192
 
 
 @dataclass(frozen=True)
@@ -195,6 +203,25 @@ class RevisionConflict(ForwarderError):
     """An optimistic replacement observed a newer revision."""
 
 
+class OffloadBudgetExceeded(ForwarderError, ValueError):
+    """No correct offload image fits within the requested row budget."""
+
+    def __init__(self, message=None, *, budget=None, minimum_rows=None):
+        self.budget = budget
+        self.max_rows = budget
+        self.minimum_rows = minimum_rows
+        if message is None:
+            message = (
+                "no correct offload image fits in "
+                f"{budget!r} rows (minimum={minimum_rows!r})"
+            )
+        super().__init__(message)
+
+
+class SoftwareUnavailable(ForwarderError, RuntimeError):
+    """A destination must use software, but software fallback is disabled."""
+
+
 @dataclass(frozen=True)
 class BatchTicket:
     """Opaque, process-unique ticket.  Do not rely on its fields."""
@@ -208,6 +235,353 @@ class BatchTicket:
 
 # Alternate opaque name.
 Ticket = BatchTicket
+
+
+# Internal label numbers are also bit positions in small integer masks.
+_LABEL_PUNT = 0
+_LABEL_DROP = 1
+_LABEL_UNROUTED = 2
+
+
+def _parse_ipv4_text(destination):
+    """Validate the public IPv4-text input and return an address object."""
+    if type(destination) is not str:
+        raise ValueError("destination must be IPv4 text")
+    try:
+        return IPv4Address(destination)
+    except ValueError as exc:
+        raise ValueError(f"invalid IPv4 destination: {destination!r}") from exc
+
+
+def lookup_image(rows, destination):
+    """Longest-prefix lookup using only exported image ``rows``.
+
+    An unmatched address is explicitly represented as ``("punt", None)``.
+    This function never consults a :class:`Forwarder` or its live table.
+    """
+    address = _parse_ipv4_text(destination)
+    return _lookup_image_parsed(rows, address)
+
+
+def _parse_offload_ranges(offload_ranges):
+    """Validate and normalize the operator-supplied LPM boolean ranges."""
+    try:
+        iterator = iter(offload_ranges)
+    except TypeError as exc:
+        raise ValueError(
+            "offload_ranges must be an iterable of (strict CIDR, bool) pairs"
+        ) from exc
+
+    parsed = []
+    seen = set()
+    for rule in iterator:
+        if len(parsed) >= MAX_OFFLOAD_RANGES:
+            raise ValueError(
+                f"at most {MAX_OFFLOAD_RANGES} offload ranges are supported"
+            )
+        try:
+            prefix_text, allowed = rule
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "each offload range must be a (strict CIDR text, bool) pair"
+            ) from exc
+
+        if type(prefix_text) is not str or type(allowed) is not bool:
+            raise ValueError(
+                "offload range prefix must be IPv4 CIDR text and value bool"
+            )
+        try:
+            network = IPv4Network(prefix_text, strict=True)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid strict IPv4 CIDR range: {prefix_text!r}"
+            ) from exc
+        if network in seen:
+            raise ValueError(f"duplicate offload range prefix: {network}")
+
+        seen.add(network)
+        parsed.append((network, allowed))
+
+    return parsed
+
+
+def _build_offload_image(table, egress_names, range_rules, max_rows):
+    """Build an exact-minimum LPM image for allowed parts of one table snapshot.
+
+    The compressed binary trie DP uses two facts for every subtree:
+
+    * ``cost[node]`` is the minimum sum when no row is installed at the node,
+      minimized over the label of the nearest ancestor image row;
+    * ``mask[node]`` is the non-empty set of ancestor labels attaining that
+      minimum.
+
+    For an ancestor label in the mask, the subtree costs ``cost``; otherwise
+    installing one row at the node with a label from the mask gives
+    ``cost + 1``.  This yields an exact global minimum without expanding IP
+    ranges to individual addresses.
+    """
+    egress_names = tuple(egress_names)
+    if len(egress_names) > MAX_OFFLOAD_EGRESSES:
+        raise ValueError(
+            f"at most {MAX_OFFLOAD_EGRESSES} egresses are supported"
+        )
+
+    label_info = [
+        ("punt", None),
+        ("drop", None),
+        ("unrouted", None),
+    ]
+    egress_label = {}
+    for index, name in enumerate(egress_names, start=_LABEL_UNROUTED + 1):
+        egress_label[name] = index
+        label_info.append(("sent", name))
+
+    # Compact flat trie.  Signed chars hold labels -1..34.
+    left = array("i", [-1])
+    right = array("i", [-1])
+    route_label = array("b", [-1])
+    range_value = array("b", [-1])
+    base_label = array("b", [_LABEL_PUNT])
+    cost = array("I", [0])
+    mask = array("Q", [0])
+
+    def add_node():
+        index = len(left)
+        left.append(-1)
+        right.append(-1)
+        route_label.append(-1)
+        range_value.append(-1)
+        base_label.append(_LABEL_PUNT)
+        cost.append(0)
+        mask.append(0)
+        return index
+
+    def insert_prefix(network):
+        node = 0
+        prefix_int = int(network.network_address)
+        for depth in range(network.prefixlen):
+            bit = (prefix_int >> (31 - depth)) & 1
+            children = right if bit else left
+            child = children[node]
+            if child == -1:
+                child = add_node()
+                children[node] = child
+            node = child
+        return node
+
+    for network, egress in table:
+        node = insert_prefix(network)
+        if egress is None:
+            route_label[node] = _LABEL_DROP
+        else:
+            try:
+                route_label[node] = egress_label[egress]
+            except KeyError as exc:
+                raise ValueError(f"unknown configured egress: {egress!r}") from exc
+
+    for network, allowed in range_rules:
+        node = insert_prefix(network)
+        range_value[node] = 1 if allowed else 0
+
+    def solve(node, depth, inherited_route, inherited_range):
+        own_route = route_label[node]
+        effective_route = (
+            own_route if own_route != -1 else inherited_route
+        )
+        own_range = range_value[node]
+        effective_range = (
+            own_range if own_range != -1 else inherited_range
+        )
+        target = (
+            effective_route if effective_range else _LABEL_PUNT
+        )
+        base_label[node] = target
+
+        if depth == 32:
+            node_cost = 0
+            node_mask = 1 << target
+        else:
+            child_data = []
+            for child in (left[node], right[node]):
+                if child == -1:
+                    # A missing child has no more-specific input prefix, so
+                    # its whole subtree is the uniform target label.
+                    child_data.append((0, 1 << target))
+                else:
+                    child_data.append(
+                        solve(
+                            child,
+                            depth + 1,
+                            effective_route,
+                            effective_range,
+                        )
+                    )
+
+            left_cost, left_mask = child_data[0]
+            right_cost, right_mask = child_data[1]
+            common = left_mask & right_mask
+            if common:
+                node_cost = left_cost + right_cost
+                node_mask = common
+            else:
+                node_cost = left_cost + right_cost + 1
+                node_mask = left_mask | right_mask
+
+        cost[node] = node_cost
+        mask[node] = node_mask
+        return node_cost, node_mask
+
+    root_cost, root_mask = solve(
+        0, 0, _LABEL_UNROUTED, 0
+    )
+    punt_bit = 1 << _LABEL_PUNT
+    if root_mask & punt_bit:
+        minimum_rows = root_cost
+    else:
+        minimum_rows = root_cost + 1
+
+    if minimum_rows > max_rows:
+        raise OffloadBudgetExceeded(
+            budget=max_rows,
+            minimum_rows=minimum_rows,
+        )
+
+    raw_rows = []
+
+    def emit(node, depth, prefix_int, ancestor_label):
+        node_mask = mask[node]
+        ancestor_bit = 1 << ancestor_label
+        if node_mask & ancestor_bit:
+            chosen_label = ancestor_label
+        else:
+            # Installing the node with any label in its mask is optimal.
+            chosen_bit = node_mask & -node_mask
+            chosen_label = chosen_bit.bit_length() - 1
+            action, egress = label_info[chosen_label]
+            raw_rows.append((prefix_int, depth, action, egress))
+
+        if depth == 32:
+            return
+
+        target = base_label[node]
+        for bit_value, child in (
+            (0, left[node]),
+            (1, right[node]),
+        ):
+            child_prefix = prefix_int | (
+                bit_value << (31 - depth)
+            )
+            if child == -1:
+                if chosen_label != target:
+                    action, egress = label_info[target]
+                    raw_rows.append(
+                        (child_prefix, depth + 1, action, egress)
+                    )
+            else:
+                emit(
+                    child,
+                    depth + 1,
+                    child_prefix,
+                    chosen_label,
+                )
+
+    emit(0, 0, 0, _LABEL_PUNT)
+    raw_rows.sort(key=lambda item: (item[0], item[1]))
+    rows = tuple(
+        (
+            f"{IPv4Address(prefix_int)}/{depth}",
+            action,
+            egress,
+        )
+        for prefix_int, depth, action, egress in raw_rows
+    )
+    return rows, minimum_rows
+
+
+class OffloadPlan:
+    """Immutable offline image plus the matching captured software table."""
+
+    __slots__ = ("_rows", "_software_routes")
+
+    def __init__(self, rows, software_routes=()):
+        self._rows = tuple(rows)
+        # The active table is already an immutable tuple of frozen networks
+        # and strings/None.  Copy the tuple reference contents defensively.
+        self._software_routes = tuple(software_routes)
+
+    @property
+    def rows(self):
+        return self._rows
+
+    def resolve(self, destination, *, software_available=True):
+        """Resolve via fast image first, then the captured software table."""
+        address = _parse_ipv4_text(destination)
+        action, egress = _lookup_image_parsed(self._rows, address)
+
+        if action != "punt":
+            return "fast", action, egress
+
+        if not software_available:
+            raise SoftwareUnavailable(
+                "destination is punted to software, but software is unavailable"
+            )
+
+        outcome = Forwarder._decide(self._software_routes, address)
+        return "software", outcome.action, outcome.egress
+
+
+_IPV4_MASKS = tuple(
+    (0xFFFFFFFF << (32 - length)) & 0xFFFFFFFF
+    for length in range(33)
+)
+
+
+def _build_image_index(rows):
+    """Build a length-keyed LPM index from valid exported image rows."""
+    by_length = {}
+    for row in rows:
+        prefix_text, action, egress = row
+        network = IPv4Network(prefix_text, strict=True)
+        value = (action, egress if action == "sent" else None)
+        by_length.setdefault(network.prefixlen, {})[
+            int(network.network_address)
+        ] = value
+    return by_length
+
+
+@lru_cache(maxsize=8)
+def _cached_image_index(rows):
+    # ``plan.rows`` is a hashable tuple of string/None tuples.  The bounded
+    # cache keeps repeated standalone lookup_image calls inexpensive.
+    return _build_image_index(rows)
+
+
+def _get_image_index(rows):
+    if isinstance(rows, tuple):
+        try:
+            return _cached_image_index(rows)
+        except TypeError:
+            # A tuple containing an unhashable row falls through to direct
+            # indexing; valid exported rows are hashable.
+            pass
+    return _build_image_index(rows)
+
+
+def _lookup_image_parsed(rows, address):
+    """Lookup helper sharing one validated address object with resolve()."""
+    address_int = int(address)
+    by_length = _get_image_index(rows)
+
+    for length in range(32, -1, -1):
+        at_length = by_length.get(length)
+        if at_length is None:
+            continue
+        network_address = address_int & _IPV4_MASKS[length]
+        result = at_length.get(network_address)
+        if result is not None:
+            return result
+
+    return "punt", None
 
 
 class _Entry:
@@ -361,6 +735,49 @@ class Forwarder:
                 )
             self._routes = candidate
             self._revision += 1
+
+    def compile_offload(self, offload_ranges, max_rows):
+        """Compile a fixed-size offline image from one consistent table snapshot.
+
+        Only the immutable active-table reference is read under the forwarder
+        lock.  All validation and compilation happen after releasing that lock;
+        the returned plan retains the same table snapshot for software fallback.
+        """
+        if (
+            isinstance(max_rows, bool)
+            or not isinstance(max_rows, int)
+            or not 0 <= max_rows <= MAX_OFFLOAD_ROWS
+        ):
+            raise ValueError(
+                "max_rows must be an integer from 0 through "
+                f"{MAX_OFFLOAD_ROWS}, and must not be bool"
+            )
+
+        with self._lock:
+            # ``_routes`` is replaced atomically with a complete immutable
+            # tuple.  Taking its reference here is the short synchronization
+            # point with replace().
+            table = self._routes
+
+        if len(table) > MAX_OFFLOAD_ROUTES:
+            raise ValueError(
+                f"at most {MAX_OFFLOAD_ROUTES} active routes are supported "
+                "for offload compilation"
+            )
+        if len(self._egresses) > MAX_OFFLOAD_EGRESSES:
+            raise ValueError(
+                f"at most {MAX_OFFLOAD_EGRESSES} configured egresses are "
+                "supported for offload compilation"
+            )
+
+        range_rules = _parse_offload_ranges(offload_ranges)
+        rows, _minimum_rows = _build_offload_image(
+            table,
+            tuple(self._egresses),
+            range_rules,
+            max_rows,
+        )
+        return OffloadPlan(rows, table)
 
     def send(self, destination, payload):
         """Return the actual action; a send error propagates without fallback."""

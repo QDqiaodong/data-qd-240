@@ -26,6 +26,114 @@ with Forwarder({"east": ("127.0.0.1", east_port)}) as fw:
 - `sendto` 抛出的 `OSError` 原样传播，不尝试其他出口；
 - 直接发送不占批次容量，也不受批次承诺保护。
 
+## 离线定容查表镜像
+
+`Forwarder.compile_offload(offload_ranges, max_rows)` 从调用时的一致活动表
+快照编译一个可独立使用的 `OffloadPlan`。新接口只做查表和判定，不调用
+`send`/`dispatch_next`，不发送数据报。
+
+```python
+ranges = [
+    ("192.0.2.0/24", True),   # 允许快路径回答整个 /24
+    ("192.0.2.16/28", False), # 但这个例外洞必须交给软件
+]
+plan = fw.compile_offload(ranges, 3)
+
+plan.rows
+# 例如：
+# (("192.0.2.0/24", "drop", None),
+#  ("192.0.2.0/25", "sent", "east"),
+#  ("192.0.2.16/28", "punt", None))
+
+from forwarding import lookup_image
+lookup_image(plan.rows, "192.0.2.17")
+# ("punt", None)
+```
+
+### 行格式
+
+`plan.rows` 是不可变的 `tuple`，其中每行是三元组：
+
+```text
+(CIDR 文本, action, egress)
+```
+
+- CIDR 是严格、规范的 IPv4 前缀文本（主机位会在输入校验阶段被拒绝）；
+- 镜像内前缀唯一，允许 `0.0.0.0/0`，也允许显式更具体的 `punt` 行；
+- `action` 与 `egress` 取值如下：
+
+| `action` | `egress` | 含义 |
+| --- | --- | --- |
+| `"sent"` | 命名出口字符串 | 最长前缀选中了该出口；仅表示策略判定，不表示发了包 |
+| `"drop"` | `None` | 原表显式丢弃 |
+| `"unrouted"` | `None` | 允许区内但原表无路由 |
+| `"punt"` | `None` | 不允许快路径给出确定结论，必须交给软件 |
+
+独立函数 `lookup_image(rows, destination) -> (action, egress)` 只依赖传入的
+导出行和 IPv4 文本，不依赖原表、范围定义或存活的 `Forwarder`。它用镜像自身
+做最长前缀匹配；没有任何行命中时返回 `("punt", None)`。镜像覆盖完整
+`0.0.0.0/0`–`255.255.255.255` 地址空间，而不是只覆盖示例网段。
+
+### 范围选择与校验
+
+`offload_ranges` 是 `(严格 IPv4 CIDR 文本, bool)` 的可迭代对象：
+
+- 布尔授权也按最长前缀匹配，未命中的布尔默认是 `False`；
+- 前缀顺序不影响语义，可嵌套授权与排除；
+- 拒绝重复前缀、带主机位的 CIDR、非 IPv4 前缀和非 `bool` 值；
+- 是否允许快路径只由这些范围决定，与路由动作、出口名或票据无关。
+
+编译规模上限为：
+
+- 至多 4096 条活动路由；
+- 至多 4096 条范围规则；
+- 至多 32 个已配置出口；
+- `max_rows` 必须是 `0..8192` 的整数，`bool` 不被当作整数。
+
+非法输入或超过上述编译规模时抛出 `ValueError`；这些上限不改变原有
+`replace`、`send` 或批次入口的行为。
+
+### 预算与失败行为
+
+编译器在压缩二进制前缀 Trie 上做精确动态规划，因此会得到全域正确镜像所需的
+最少行数（实现直接输出该最优行数）：
+
+- 最少行数不超过 `max_rows` 时成功，`len(plan.rows) <= max_rows`；
+- 不存在满足预算的正确镜像时，抛出可从 `forwarding` 导入的
+  `OffloadBudgetExceeded`，不返回截断镜像，也不会偷偷把允许区改成 `punt`；
+- 异常提供 `budget`/`max_rows` 和 `minimum_rows` 诊断属性；
+- 空范围集的结果是空行元组，因此预算 `0` 也能成功；它表示所有地址都 `punt`。
+
+`OffloadBudgetExceeded` 同时继承 `ForwarderError` 和 `ValueError`，但调用方
+通常应显式捕获这个专用类型。
+
+### `plan.resolve(destination, *, software_available=True)`
+
+返回 `(source, action, egress)`，其中 `source` 是 `"fast"` 或
+`"software"`：
+
+1. 始终先查离线镜像；
+2. 镜像结果不是 `"punt"` 时，直接返回 `source="fast"`，不查询软件；
+3. 镜像结果是 `"punt"` 且 `software_available=True` 时，调用编译时捕获的
+   同一份活动表上的原最长前缀选路，返回 `source="software"`；
+4. 镜像结果是 `"punt"` 且 `software_available=False` 时，抛出可从
+   `forwarding` 导入的 `SoftwareUnavailable`，不会改报 `unrouted`，也不使用
+   缓存出口。
+
+`lookup_image` 和 `plan.resolve` 都要求 IPv4 文本；非法文本（包括非字符串、
+IPv6、带 `/mask` 的地址等）抛出 `ValueError`。两条路径都不触碰 UDP 发送。
+
+### 快照、锁与 `replace`
+
+`compile_offload` 只在短暂进入转发器状态锁时取得不可变的 `_routes` 元组引用；
+范围校验和 Trie 编译均在锁外执行，不会在整个编译期间阻塞 `replace` 或票据
+状态转换。
+
+`OffloadPlan` 的导出行和软件兜底都使用这同一份表快照。之后调用
+`replace` 会增加修订号并更新活动表，但已经发出的旧计划仍按旧表做软件选路；
+只有新调用的 `compile_offload` 才使用新表。编译成功或预算/输入失败都不会修改
+当前活动表、修订号或票据。
+
 ## 批次托管接口
 
 ### `ticket = reserve(samples)`
@@ -179,7 +287,11 @@ fw.revision  # 初始为 0
 ```sh
 python3 -m unittest -v
 python3 -m unittest -v test_batch_forwarding.py
+python3 -m unittest -v test_offload.py
 python3 demo.py
+
+# 规模用例可在 192 MiB 虚拟地址空间限制下复现：
+(ulimit -v 196608; python3 -m unittest -v test_offload.py)
 ```
 
 `test_forwarding.py` 保留原有回归；`test_batch_forwarding.py` 覆盖：
@@ -194,6 +306,31 @@ python3 demo.py
 - 非法 `replace` 保留活动表、修订号和票据；
 - 未知/跨实例票据抛出 `LookupError` 且不触发发送；
 - 上下文退出放弃余项并关闭 socket。
+
+`test_offload.py` 覆盖离线演练验收：
+
+- `192.0.2.0/24` 的 east/drop 策略、`192.0.2.16/28` 排除洞、预算 2 失败/
+  预算 3 成功；联合固定区间边界与导出行边界逐段调用独立的
+  `lookup_image` 核对；
+- 同一 `192.0.2.17` 在有洞且软件在线时走软件 east、软件停用时报
+  `SoftwareUnavailable`，移除排除后软件停用也能走快路径 east；
+- 授权无路由网段在软件停用时由快路径给出 `unrouted`，相邻未授权地址仍
+  `punt`/报 `SoftwareUnavailable`；
+- 旧 `OffloadPlan` 在 `replace` 后仍使用旧表做软件兜底，新编译才使用新表；
+- 空范围 + 预算 0、单个无路由 `/32` 在预算 0 下报
+  `OffloadBudgetExceeded(minimum_rows=1)`；
+- 非法 CIDR/布尔/预算/IPv4 文本和编译规模限制；
+- 4096 条分散 `/32` 路由、4096 条 `/32` 授权、32 个出口和预算 4096 的规模
+  用例，并抽查授权且有路由、授权但无路由、未授权但有路由三类点。
+
+关键断言通过后，离线路径测试会打印实际行数、`fast`/`software` 来源和拒绝
+类型，例如：
+
+```text
+[offload acceptance 1] budget_2_rejection=OffloadBudgetExceeded(minimum_rows=3); budget_3_actual_rows=3; ...
+[offload acceptance 2] hole_.17_online_path=('software', 'sent', 'east'); hole_.17_offline_rejection=SoftwareUnavailable; ...
+[offload scale] routes=4096 ranges=4096 egresses=32 budget=4096; actual_rows=4096; ...
+```
 
 正向案例使用真实临时回环 UDP socket，并由测试自行按收包 socket 和合成载荷
 给出独立预期，不调用被测选路函数计算正确答案。并发案例使用 `Event`、
