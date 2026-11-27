@@ -282,13 +282,102 @@ fw.revision  # 初始为 0
 约定调用方先收束自己的并发调用；若仍有发送，关闭 socket 可能使该发送收到
 `OSError`。
 
+## 接收侧重整与有序交付（`receiving.py`）
+
+`WindowReceiver(manifest, byte_budget)` 在接收器侧把跨数据报的测试样本重新
+拼回完整字节，并按流、按序号有序交付给比对程序。它**只接收、不发送**：没有
+socket、定时器或后台线程，不探测、不补发、不访问外网；`seal` 是本地调度决定，
+不是网络控制包。发送、选路、批次承诺和离线镜像的行为均不变。
+
+### 数据报格式与 `encode_slice`
+
+```python
+from receiving import encode_slice
+datagram = encode_slice(number, offset, data)
+# 前 8 字节：大端 uint32 样本序号、大端 uint32 从零开始的字节偏移；其后为非空 bytes
+```
+
+- 载荷不含目标 IP、接收器名或任何控制指令，接收器名由调用方按实际收包 socket
+  提供；
+- 整报不超过原发送入口的 4096 字节，`offset + len(data) <= 65536`；
+- 拒绝非法类型（`bool` 不算整数、`data` 必须是非空 `bytes`）、零序号和超界字段。
+
+### 清单、流与构造校验
+
+`manifest` 是非空映射：1–8 个非空字符串接收器名，每个名字映射到 1–128 个样本
+长度（1–65536 的非布尔整数），样本序号从 1 开始。`byte_budget` 是 0–1048576
+的非布尔整数，整个实例共享。构造时完整校验并固定清单；实例支持单线程串行调用，
+不做持久化。不同流的同序号样本不共享任何字节或交付状态。
+
+### `feed(receiver, datagram) -> (status, events)`
+
+先校验再改动：未知流、非法报文、清单中不存在的序号或超出该样本长度的片段一律
+抛 `ValueError` 且不改变任何流。返回标记：
+
+| 状态 | 含义 |
+| --- | --- |
+| `"accepted"` | 片段纳入；可能同时返回有序交付事件 |
+| `"duplicate"` | 合法重复片，不增加任何覆盖，无事件 |
+| `"conflict"` | 重叠字节与已保留字节不一致；整片拒绝，连它带来的新字节也不保留 |
+| `"late"` | 序号已终结（已交付或已封缺口），不重开样本 |
+| `"pressure"` | 见下方压力策略，不纳入来片、无事件 |
+
+收齐判断只看每个字节位置的实际覆盖，不看片段数、累计片长，也不做零填充。
+
+### 交付与 `seal(receiver, through)`
+
+每条流从序号 1 起按序交付，每号恰好一次：
+
+- 收齐的样本在轮到它时交付 `("message", receiver, number, data)`；前序未终结时
+  即使自己完整也继续保留；一次 `feed` 可在同一次调用里链式交付随后所有连续完整
+  样本；
+- `seal(receiver, through)`（`0 <= through <= 本流清单长度`，越界/非法类型/未知流
+  抛 `ValueError` 且无副作用）声明截至 `through` 不再等缺片：已终结序号不重发；
+  范围内完整样本按原字节交付 `message`，不完整（含完全没收到的）丢掉部分字节并
+  交付 `("gap", receiver, number, "sealed")`；随后连续完整的后继即使超过界限也
+  立即交付。被封缺口的序号永久关闭，之后同号片段一律 `late`；其他流不受影响。
+
+### 共用缓冲预算与选定的压力策略：保留前序
+
+只读属性 `buffered_bytes` 只统计尚未终结样本**已保留的不同字节**：包括缺片中的
+字节和排在前序之后的完整样本；不含空洞、重复字节和已交付事件字节，也没有任何
+不入账的副本或文件转存。
+
+本实现只实现题目允许的两种策略之一——**保留前序**：
+
+- 来片纳入后，若按正常交付规则链式交付完仍会超过 `byte_budget`，立即返回
+  `("pressure", ())`，不保留来片任何字节，原有覆盖和交付状态完全不变；
+- 若纳入后随即的正常交付就能腾出足够空间，则必须纳入（例如来片正好补全队头，
+  队头若干完整样本在同一次调用里交付释放空间）；
+- 不会为腾空间牺牲任何已保留样本，也不能跨流销账或跳过自己流上的完整样本。
+  调度方只能接受这次未纳入，或在空间释放后用手头的合成样本重新提交同一接口。
+
+### 最小回环示例
+
+`demo_receive.py` 沿用原有 `Forwarder.send` 和 `demo.receiver` 风格的临时回环
+UDP 接收器：先真实收包，再把**实际收到的原始报文**交给 `WindowReceiver.feed`，
+打印每一步的返回标记、交付事件和缓冲用量：
+
+```sh
+python3 demo_receive.py
+# east sample-2-first  status=accepted  events=() buffered=3
+# east sample-1-tail   status=accepted  events=() buffered=6
+# west complete        status=accepted  events=(('message', 'west', 1, b'west'),) buffered=6
+# east sample-1-head   status=accepted  events=(('message', 'east', 1, b'abcde'),
+#                                              ('message', 'east', 2, b'XYZ')) buffered=0
+```
+
 ## 测试与复现
 
 ```sh
 python3 -m unittest -v
+python3 -m unittest -v test_forwarding.py
 python3 -m unittest -v test_batch_forwarding.py
 python3 -m unittest -v test_offload.py
+python3 -m unittest -v test_receiving.py
 python3 demo.py
+python3 demo_receive.py
+```
 
 # 规模用例可在 192 MiB 虚拟地址空间限制下复现：
 (ulimit -v 196608; python3 -m unittest -v test_offload.py)
@@ -346,3 +435,32 @@ python3 demo.py
 
 这些值来自当次异常、`revision` 和真实 socket 收包结果，而不是把测试预期直接
 当作实测输出。
+
+`test_receiving.py` 覆盖接收侧验收，且所有预期字节都是测试内的合成字面量，不
+用被测代码生成答案：
+
+- 场景 1：同一份“先收样本 1 中段、再收齐样本 2”的输入跑两条对照路线——不封口时
+  补齐前序后按序得到 `abcdef`、`XYZ`；封口界限从 0 改到 1 时先得第 1 号
+  `gap` 再得第 2 号完整字节，且同一补片之后一律 `late`，缺口不会变回消息。
+  另核对一致重叠/带新字节的冲突重叠/非法越界片对覆盖和预算的影响，以及完全未
+  收到的序号随封口产生缺口；
+- 场景 2：预算 8、已占 7 字节时来片再要 2 字节——保留前序策略返回 `pressure`、
+  占用仍是 7；补齐队头的调用一次交付样本 1、2 后，重新提交的样本 3 才交付；
+  第二条流在预算凑满时不能从第一条流销账或跳过自己；并覆盖预算临界值与零预算；
+- 场景 3：通过真实 `Forwarder.send` 把编码片段发到两个临时 IPv4 回环接收器，
+  只把各自实际 `recv` 到的原始报文喂给接收模块；同序号不同字节的两条流不能互
+  拼，校验交付事件中的接收器名、顺序和准确字节，结束后两个 socket 均无余包；
+- 单元覆盖：`encode_slice` 类型/零序号/超界校验、清单与预算构造校验、`feed`
+  未知流/坏报文/越界校验且无副作用、`duplicate`/`conflict`（新字节随整片丢弃）/
+  `late`、乱序链式交付、流之间互不共享状态、`seal` 非法参数无副作用。
+
+关键断言通过后，场景 1、2（以及场景 3）会打印当次实际观察到的交付/缺口顺序、
+返回标记和缓冲用量，例如：
+
+```text
+[scenario 1 observed] branch=seal_through_1 seal_events=[gap:1:sealed, message:2:b'XYZ']; later_slice_statuses=['late', 'late', 'late']; buffered_bytes=0
+[scenario 2 observed] policy=retain_predecessor pressure_status=pressure (stream b, retained=7, no cross-stream write-off); ...
+[scenario 3 observed] real_loopback b_delivery=[message:b:1:b'0123']; a_delivery=[message:a:1:b'efgh', message:a:2:b'SECD']; ...
+```
+
+这些输出来自真实调用返回值、事件元组和 `buffered_bytes`，不是预先写好的结果。
