@@ -367,6 +367,138 @@ python3 demo_receive.py
 #                                              ('message', 'east', 2, b'XYZ')) buffered=0
 ```
 
+#### 可选录制与重开续读
+
+不传参数时行为与上面完全一致。加 `--spool PATH` 创建一份本地交付记录，并把
+**本次真实收包后由接收器实际生成的每个非空组**按原顺序提交；没有事件的步骤不
+提交。`--read PATH` 是另一次运行：它按原配置重开该记录，从比较器的已确认游标
+续读，然后确认、回收并再读一次，用来展示录制方退出后结果仍在：
+
+```sh
+python3 demo_receive.py --spool /tmp/drill.spool
+# ... 原四行输出 ...
+# delivery record created: /tmp/drill.spool (reader='comparator', capacity=64,
+#   groups=2, highest_delivery=3)
+
+python3 demo_receive.py --read /tmp/drill.spool
+# record reopened: groups=2 highest_delivery=3 comparator_cursor=0 usage=12
+#   page=[(1, ('message', 'west', 1, b'west')),
+#         (2, ('message', 'east', 1, b'abcde'))]
+# comparator confirmed through 2
+# record reclaimed through 2, usage now 3
+# comparator reread after reclamation: [(3, ('message', 'east', 2, b'XYZ'))]
+```
+
+`--spool` 拒绝覆盖已存在的路径；要重开请用 `--read`。两个参数不能同时给出。
+记录的对象只是接收器已经产出的事件，演示不会因此改变收发、重组或默认输出。
+
+## 可重开的本地交付记录（`delivery_spool.py`）
+
+`DeliverySpool` 把一个演练中接收器产出的非空事件组记录到本地文件，让两套比对
+程序各自按需读取、各自确认，并允许录制方和读者在进程退出后原样重开。它只处理
+**已经生成的事件**（`message` / `gap`），不接触 UDP 数据报，不恢复未完成的重组，
+不发送、不探测、不访问外网；只用 Python 3.9+ 标准库。
+
+### 创建与重开
+
+```python
+from delivery_spool import DeliverySpool
+
+spool = DeliverySpool.create("/tmp/drill.spool", ["cmpA", "cmpB"],
+                             capacity=64)          # 新建（路径已存在则抛 RecordExists）
+...
+spool = DeliverySpool.open("/tmp/drill.spool")     # 重开：沿用原读者名与容量，保留进度
+```
+
+- 创建时确定非空且互异的读者名与正整数容量（`bool` 不算整数）；重开时只读回
+  原配置，重新 `create` 一个已存在的路径会被拒绝，绝不静默覆盖。
+- 评价按串行方式使用：一次只有一个进程打开记录。不提供多进程并发写，也不模拟
+  断电；写入以整份记录的原子替换提交，因此重开看到的是某次完整提交或更早的
+  完整提交。
+- 只读诊断：`readers`、`capacity`、`usage`/`usage_bytes`、`retained_events`、
+  `highest_delivery`、`reclaimed_through`、`committed_groups`、
+  `next_group_number`、`cursor(reader)`、`stored_receipt(group_number)`。
+
+### 提交整组：`submit(group_number, events) -> DeliveryReceipt`
+
+`events` 是接收器原样的 4 元组序列，例如
+`(("gap", "s", 1, "sealed"), ("message", "s", 2, b"XYZ"))`。提交规则：
+
+- 每组必须非空；空序列抛 `EmptyGroup`，不会提交，也不消耗任何编号。
+- 组号由调用者提供，从 1 连续递增；正常前进时只能是 `next_group_number`。
+- 记录给事件另发从 1 起的连续**交付号**，顺序按各次提交、组内按原顺序；回执
+  `DeliveryReceipt(group_number, first_delivery, last_delivery, event_count)`
+  指出这组的首尾交付号。
+- 只暴露整组结果：容量不足时抛 `CapacityExceeded`，写入在提交前失败时抛
+  `SpoolWriteError`；两者都不改变记录、不消耗组号或交付号，读者看不到半组。
+- **重放最近一次已提交组**：用 `group_number == 最近已提交组号` 且内容相同
+  （按规范内容摘要判定）重试，直接返回原回执，不写记录——即使该组已被回收，
+  或当前空间放不下同样的数据。
+- 同号异内容抛 `GroupConflict`；早于最近已提交组号抛 `StaleGroup`；向前跳号抛
+  `GroupGap`；三者都可与容量不足区分，且不修改记录。提交前失败的组可以用原
+  组号再试。
+
+### 容量与用量
+
+`usage` 按**仍留存的事件**计：完整样本计载荷字节数，缺口计 1；读者游标、回执
+元数据和底层文件页开销不计。确认或回收尚未成功时，已可删的事件仍占容量——只有
+回收提交成功才归还额度，`reclaim()` 返回的 `ReclaimResult`
+（`reclaimed_through`、`freed_events`、`freed_bytes`、`usage`）报告实际归还量。
+容量不足时由调用者决定何时重试；记录不会跳过读者、丢弃已发布事件或阻塞等待
+读者确认。
+
+### 各读各的：`read` / `confirm` / `reclaim`
+
+```python
+page = spool.read("cmpA", limit=2)   # [(交付号, 原事件), ...]
+spool.confirm("cmpA", 3)             # 累计确认：不再需要 3 号及以前
+result = spool.reclaim()             # 删除所有读者都已确认的公共前缀
+```
+
+- `read(reader, limit)` 从该读者自己的已确认交付号之后分页返回，`limit` 必须是
+  正整数（`bool` 不算）。读取不等于确认，可重复读。
+- `confirm(reader, through)` 报累计确认号；不得超过已提交的最高交付号（否则
+  `InvalidAck`），对有效读者重复确认旧号是无副作用的成功并返回当前游标。
+- 未知读者抛 `UnknownReader`（`LookupError` 子类），非法页大小抛
+  `InvalidPageSize`。
+- 重开后恢复各自确认进度；没确认且未回收的结果仍可读，允许比对程序自己重复
+  处理——本记录不宣称对外部比对操作恰好一次。
+
+**选定的确认/回收路线：独立提交**（题目允许的两条路线之一）。`confirm` 单独
+持久化游标；`reclaim` 是显式且独立的提交，把公共确认前缀整体删除。若回收写失败，
+确认仍然有效，未归还的容量继续占用，调用者只需重试 `reclaim()` 而不必重交确认。
+公共前缀的删除按整份记录的原子替换完成，不会只删一部分就宣布成功；没有可回收
+前缀时抛 `NothingToReclaim`，与容量不足、与回收写失败都可区分。
+
+### 错误一览
+
+| 情况 | 异常 | 说明 |
+| --- | --- | --- |
+| 创建/读取参数非法 | `ConfigurationError`(`ValueError`) | 含容量、读者名、页大小、确认号 |
+| 新建已存在路径 | `RecordExists` | `ConfigurationError` 子类 |
+| 记录文件损坏/版本不符 | `CorruptRecord`(`ValueError`) | 重开时校验结构 |
+| 未知读者 | `UnknownReader`(`LookupError`) | |
+| 组内容形状非法 / 空组 | `InvalidEvent` / `EmptyGroup` | |
+| 组号不对 | `GroupNumberError`(`ValueError`) | 含 `GroupConflict`/`StaleGroup`/`GroupGap` |
+| 容量不足 | `CapacityExceeded` | **不是** `ValueError`，不消耗编号 |
+| 无可回收前缀 | `NothingToReclaim` | 与写失败分开 |
+| 提交前写失败 | `SpoolWriteError` | 记录保持原提交 |
+
+### 恢复语义（重开时如何解释现状）
+
+重开后从文件中读回：读者名与容量、已提交组的连续编号与交付号区间、仍留存的
+事件（含完整字节或缺口原因）、各读者游标、`highest_delivery`（含已回收区间）、
+`reclaimed_through`。由此可解释：每个读者下一次 `read` 从何处开始、哪些交付号
+已被确认、哪些字节仍占容量。写入模型只有两种可见状态——上一次成功提交的记录或
+更早的完整记录；回收与确认各自的提交是原子的，不存在“删了一半就对外成功”的
+中间态。
+
+### 与接收演示接通
+
+`demo_receive.py --spool` 只把每步**实际收包后由 `WindowReceiver` 生成的非空
+事件组**提交给记录（空组不提交），`--read` 再重开续读。发送、批次、离线镜像与
+接收重组接口及其回归测试均保持不变。
+
 ## 测试与复现
 
 ```sh
@@ -375,8 +507,10 @@ python3 -m unittest -v test_forwarding.py
 python3 -m unittest -v test_batch_forwarding.py
 python3 -m unittest -v test_offload.py
 python3 -m unittest -v test_receiving.py
+python3 -m unittest -v test_delivery_spool.py
 python3 demo.py
 python3 demo_receive.py
+python3 demo_receive.py --spool /tmp/drill.spool && python3 demo_receive.py --read /tmp/drill.spool
 ```
 
 # 规模用例可在 192 MiB 虚拟地址空间限制下复现：
@@ -464,3 +598,39 @@ python3 demo_receive.py
 ```
 
 这些输出来自真实调用返回值、事件元组和 `buffered_bytes`，不是预先写好的结果。
+
+`test_delivery_spool.py` 覆盖交付记录的三条验收。预期交付号、用量和分页内容
+都是测试中独立写出的字面量；持久化失败夹具直接替换真实的
+`delivery_spool._atomic_replace`（提交边界）与 `_after_commit`（提交后回调），
+而不是用非法参数模拟写失败：
+
+- 场景 1：用真实 `WindowReceiver` 先收齐样本 2，再 `seal` 封掉样本 1，得到
+  “缺口 + 完整样本”整组。先在提交边界注入失败，重开后读者看不到半组、组号与
+  交付号都未消耗；用同一组号重写，交付号 1–2 连续。随后在提交成功后让回调抛错
+  模拟回执丢失，重开后重复提交同组内容得到原号码区间且只读到一份；改动一字节的
+  同号重试抛 `GroupConflict`。全部确认并回收后再次重开、重试同一组号仍返回原回
+  执（3–3），记录不复活；更早组号抛 `StaleGroup`；
+- 场景 2：容量 8、两名读者，写入 4 字节完整样本 + 缺口 + 3 字节完整样本（用量
+  恰为 8）。甲确认至 3、乙仅读不确认时回收抛 `NothingToReclaim`，录制方提交下一
+  组 4 字节样本被 `CapacityExceeded(requested=4, available=0)` 拒绝；仅把乙确认
+  推进到 1 后回收，用量由 8 降到 4，原被拒组以交付号 4 提交成功。重开后乙读到
+  2、3、4，甲只读到 4；
+- 场景 3：从同一初始进度出发，乙确认到 1 后令回收的删除路径在提交前失败——重开
+  后乙的确认仍在（游标 1），从 2 开始读，用量仍为 8，原被拒组仍被拒；只重试回收
+  即成功归还 4 字节，随后可写入原被拒组。失败抛 `SpoolWriteError`，与
+  `NothingToReclaim` 明确区分，也不能靠放宽容量绕过；
+- 另有创建/重开配置保留、未知读者、非法页大小/确认号、组内容形状校验、缺口计 1
+  与完整样本计载荷、公共前缀精确回收，以及接收演示录制模式只提交实际产出的非空组
+  并可在另一次打开后续读的覆盖。
+
+关键断言通过后，测试打印当次实际观察到的拒绝类型、确认后读到的交付号和用量，
+例如：
+
+```text
+[delivery scenario 1 observed] interrupted_write=SpoolWriteError (replace attempts=1); committed_range_after_retry=1-2; lost_receipt_replay=3-3; ...
+[delivery scenario 2 observed] empty_reclaim=NothingToReclaim; rejected_submit=CapacityExceeded(requested=4, available=0); usage_before=8; usage_after_reclaim=4; ... b_reads=[2, 3, 4]; a_reads=[4]
+[delivery scenario 3 observed] empty_reclaim=NothingToReclaim; failed_reclaim=SpoolWriteError; ... cursor_b_after_reopen=1; reclaimed_through_after_failure=0; usage_after_failure=8; b_reads_after_reopen=[2, 3]; ...
+```
+
+这些值来自当次异常属性、`cursor`/`read` 与 `usage` 的实际返回，而不是把固定预期
+当作实测打印。
