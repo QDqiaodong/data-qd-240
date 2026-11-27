@@ -499,6 +499,80 @@ result = spool.reclaim()             # 删除所有读者都已确认的公共�
 事件组**提交给记录（空组不提交），`--read` 再重开续读。发送、批次、离线镜像与
 接收重组接口及其回归测试均保持不变。
 
+## 回环演练：结论与原字节复查分离（`drill_review.py`）
+
+`ReviewSpool` 消费 `WindowReceiver` 的离线终态事件（`message`/`gap`），把
+**结论读取**与**原字节复查**两件事拆开：所有读者都能分页读结论（不含载荷），
+只有登记的复查读者在确认前能取回某条完整样本的原字节。它不发包、不开 socket、
+不起线程；原字节在接纳之后唯一的回读途径是调用方给出的
+`recall(stream, number)`（一个已在本地打开的只读来源的进程内模型），该来源也可能
+抛 `OSError`、返回非字节、读回不完整或返回同长度异内容。仅用 Python 3.9+ 标准库，
+串行调用、无睡眠。
+
+### 创建与预算
+
+```python
+spool = ReviewSpool(
+    directory,            # 必须是已存在且空的独占工作目录
+    readers,              # 1–4 个互异非空字符串
+    reviewers,            # 其中 1–2 名有原字节复查权的读者
+    recall,               # callable(stream, number) -> bytes
+    resident_bytes=4096,  # 常驻载荷上限（0..16 KiB）
+    disk_bytes=8192,      # 目录载荷上限（0..16 KiB）
+    recall_slots=2,       # 同时依赖回读的不同未确认样本数（0..8）
+)
+```
+
+- 固定选址策略：**优先本地保留**。样本先尽量常驻内存，否则写工作目录内的私有载荷
+  文件，再否则占用一个回读名额。不同身份可以走不同层级；任何一份持久载荷只在一处
+  计数，不用去重、压缩、额外文件或外部进程规避限额。一次调用最多另有一份正在读写的
+  工作缓冲，调用结束不留存。
+- 样本长 1–4096 字节，最多 64 次成功交付。
+- `submit(event)` 真正接纳后返回从 1 起的连续交付号；同流样本号按事件原语义递增，
+  容量不足抛 `CapacityError`，不消费交付号、不记住身份，可原样重试。缺口是有结论、
+  无载荷的有效事件，不占字节预算；结论索引不存载荷。
+
+### 各读各的结论与独立的复查权
+
+- `read(reader, limit)` 按该读者自己的已确认位置分页，返回按号排列的
+  `(交付号, 类别, 流名, 样本号, 缺口原因或 None)`；读取不推进确认。
+- `confirm(reader, through)` 是累计确认，重复或回退确认无副作用；非法号抛
+  `InvalidAck`，未知读者抛 `UnknownReader`。
+- **载荷释放只看复查读者**：最后一名复查读者确认某号后才释放该样本载荷；普通统计
+  读者即使未确认也继续读到原结论。结论本身要等**所有**读者都确认后才清理。
+- `sample(reader, delivery_id)` 仅向尚未确认该号的复查读者返回原字节；无权、已确认
+  或缺口抛内建 `LookupError`。来源报错、读回不完整或同长度异内容一律抛
+  `RecallError`，承诺与游标不变，故障消除后可重试（回读内容以接纳时记录的 SHA-256
+  摘要与长度校验，绝不因来源自称成功就把错误内容交给读者）。
+
+### 回读来源下线：`withdraw(stream, number)`
+
+表示该身份的回读来源即将关闭，只影响这一个身份：
+
+- 该身份本就不依赖回读（本地持有、已释放或与本 spool 无关）时返回 `True`，调用方可
+  立即关闭来源，重复调用幂等且绝不回读已关闭的来源；
+- 仍欠复查且只存在于来源之后时，先实测回读并校验。失败则返回 `False`（不抛错、不改
+  任何承诺与游标），调用方保留来源、稍后重试；
+- 本地空间不足时，可把**其他仍能稳定回读**的样本经各自来源实测后降级为回读依赖，腾出
+  位置把目标样本复制到本地；全程不超预算、不丢旧承诺。替换副本先写临时工作缓冲，任何
+  本地读写失败都发生在状态改动之前，旧状态保持不变，成功关闭后该身份不再被回读。
+
+`usage()` 返回 `(常驻载荷字节, 磁盘载荷字节, 依赖回读的交付号升序元组)`；`close()`
+只清理自己创建的载荷与临时文件，不删无关文件，支持 `with`。
+
+### 错误一览
+
+| 情况 | 异常 |
+| --- | --- |
+| 构造/调用参数非法（含非 bool 整数校验） | `ConfigurationError`（`ValueError` 子类） |
+| 事件形状或同流序号非法 | `InvalidEvent` |
+| 确认号非法 / 页大小非法 | `InvalidAck` / `InvalidPageSize` |
+| 未知读者 | `UnknownReader`（`LookupError` 子类） |
+| 三层都放不下 | `CapacityError`（不消费编号） |
+| 回读来源报错、不完整或同长度异内容 | `RecallError` |
+| 本地载荷写失败（提交或下线途中） | `SpoolWriteError` / `withdraw` 返回 `False` |
+| 无权/已确认/缺口的复查，或结论已清理 | 内建 `LookupError` |
+
 ## 测试与复现
 
 ```sh
@@ -508,6 +582,7 @@ python3 -m unittest -v test_batch_forwarding.py
 python3 -m unittest -v test_offload.py
 python3 -m unittest -v test_receiving.py
 python3 -m unittest -v test_delivery_spool.py
+python3 -m unittest -v test_drill_review.py
 python3 demo.py
 python3 demo_receive.py
 python3 demo_receive.py --spool /tmp/drill.spool && python3 demo_receive.py --read /tmp/drill.spool
@@ -634,3 +709,34 @@ python3 demo_receive.py --spool /tmp/drill.spool && python3 demo_receive.py --re
 
 这些值来自当次异常属性、`cursor`/`read` 与 `usage` 的实际返回，而不是把固定预期
 当作实测打印。
+
+`test_drill_review.py` 覆盖回环演练的三条离线验收，四份 4096 字节样本都由两个真实
+`WindowReceiver` 从合成切片重组，回读由可注入故障的进程内来源夹具驱动，全程不发包、
+不开 socket：
+
+- 场景 1：内存 4096、盘 8192、回读名额 2 下四份全接纳且确有一份（D）真实依赖回读；
+  A 本地持有时来源故障仍可安全下线并读回原文；D 来源报错时 `withdraw` 返回 `False`、
+  游标与用量不变，恢复后可读回；对仍依赖回读的身份注入同长度异内容，`sample` 抛
+  `RecallError` 且不推进游标；下线 D 时把另一可稳定回读的样本（B）实测后降级为回读，
+  不超预算、不丢承诺，关闭后的来源不再被回读。
+- 场景 2：回读名额 0。A、B、C 已接纳而普通读者未确认时 D 被 `CapacityError` 拒收且不
+  消费交付号；仅当两名复查读者都确认 A、其载荷释放后，D 以同一身份接纳为 4；普通读者
+  仍读到 A–D 四份结论，复查读者仍能取得未确认的 B、C、D 原字节；对真实 `seal` 得到的
+  缺口核对无载荷（`sample` 抛 `LookupError`）；退出后无临时残留且不删无关文件。
+- 场景 3：替换真实写入边界 `_write_payload_file` 注入失败，验证下线途中本地写失败后
+  旧状态（用量、回读号、游标、承诺）完整、无残留临时文件，恢复后重试成功；另覆盖提交
+  写失败不消耗编号、未知读者、非前进确认、事件与序号校验、构造校验，以及“载荷由复查
+  读者子集决定、结论由全体读者决定”的独立生命周期。
+
+关键断言通过后，测试打印当次实际获得的回读号、撤回结果、是否仍能复查与第四份的交付
+号，例如：
+
+```text
+[drill scenario 1 observed] recall_ids=(4,); withdraw_a=True (resident, source closed); withdraw_d_while_faulted=False; corrupt_recall=RecallError; withdraw_d_after_recovery=True (demoted B to recall); recall_after_withdraw=(2,); ...
+[drill scenario 2 observed] d_rejected_before_full_confirm=CapacityError; fourth_delivery_id=4; stat_conclusion_ids=[1, 2, 3, 4]; reviewers_still_read_bcd=True; gap_delivery=5 (no payload); residue_after_close=[]
+[drill scenario 3 observed] write_failure_withdraw_result=False; write_attempts=1; state_after_failure=(4096, 8192, (4,)); retry_after_recovery=True; recall_after_retry=(2,)
+```
+
+这些值来自当次 `usage()`、`withdraw`/`sample`/`submit` 的真实返回与来源夹具的真实调用
+记录，而不是把测试预期当作实测打印。原有 `test_receiving.py` 与
+`test_delivery_spool.py` 回归保持通过。
