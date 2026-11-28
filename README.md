@@ -573,6 +573,72 @@ spool = ReviewSpool(
 | 本地载荷写失败（提交或下线途中） | `SpoolWriteError` / `withdraw` 返回 `False` |
 | 无权/已确认/缺口的复查，或结论已清理 | 内建 `LookupError` |
 
+## 离线槽位发布与查询（`rollout.py`）
+
+`Rollout(driver, slots, eligible, active, target)` 在一轮离线演练中，把一个旧版本
+（`active`）和一个已审核的目标版本（`target`）从版本 1 切到版本 2。两组策略共用
+每台模拟设备有限的槽位；读表校验程序独立调用 `resolve`，只能从物理上确实持有
+当前版本整组镜像的设备作答。全程不打开套接字、不访问真实设备，只用标准库和调用方
+提供的本机驱动。
+
+```python
+from rollout import Rollout
+
+rollout = Rollout(driver, {"A": 2, "B": 2, "C": 2}, ("A", "B", "C"), active, target)
+revision, bank, action, egress = rollout.resolve("red", "198.51.100.7")
+assert revision == 1                      # 尚未发布
+assert rollout.publish() == 2             # 成功切到目标版本
+assert rollout.resolve("red", "198.51.100.0") == (2, "C", "sent", "red-low")
+```
+
+### 版本与行
+
+- `active`、`target` 是相同两个组名到查表行序列的映射；组名非空且互异。
+- 每组每版本 1 至 2 行，行沿用 `lookup_image` 的 `(CIDR, action, egress)` 格式；
+  同组内前缀不重复，CIDR 为规范 IPv4 前缀。未命中一律 `("punt", None)`。
+- `slots` 是设备名到固定槽数的映射（2 至 3 台，每台 1 至 2 槽）。每槽只放
+  `(组名, CIDR, action, egress)` 或 `None`，同组同前缀不能在同一台设备重复。
+- 一条完全相同的物理行可以同时满足两个版本；不同的行即使语义相似也不算相同。
+
+### 驱动与只读查询
+
+驱动只需三个方法：
+
+- `inspect(bank)` 按槽号返回当前内容元组；
+- `program(bank, index, row)` 原子写入一个零基槽（`None` 置空）；
+- `lookup(bank, group, address)` 按 `lookup_image` 语义返回 `(action, egress)`。
+
+构造与 `resolve` 均不发出编程请求，`eligible` 之外的设备不会被读写，也不计入容量。
+`resolve(group, address)` 返回 `(revision, bank, action, egress)`，要求被选设备的该组
+物理行与当前发布版本的整组镜像完全相同：缺行、混入另一版额外行、或某台设备只是碰巧
+对本地址返回相同结果，都不算就绪。查询不会拼接两台设备的半份镜像，也不会用发布方内存
+里的期望行直接作答；`action`/`egress` 始终来自 `lookup`。没有可用设备时抛
+`NoReadyImage`。
+
+### 发布的安全性
+
+`publish()` 先读完可用设备的真实槽内容并规划完整写入顺序，再开始编程：
+
+- 每写完一个槽，两个组都必须仍能从某台持有完整旧镜像的设备按版本 1 查询；
+- 只有当同一物理布局同时能服务两组旧版、且两组都已有完整目标镜像时，才把两组一起
+  切到版本 2；切换是最后一步，之后立即按目标查询，不清理残留旧行；
+- 只要存在符合上述条件的写入路径就必须接受，即使两组新版放不进同一台设备、或最先
+  尝试的排布走不通（规划会回溯）；确实没有路径时抛 `NoSafeLayout`，且不写任何槽；
+- 不能临时增加槽、调用驱动未提供的整机换表动作，或中途让任一组查不到。
+
+`publish()` 成功返回 `2`。若 `program` 抛 `OSError`，原异常原样上抛，不升级版本、
+不再下发剩余写入；该次写入可能已生效，因此后续 `resolve` 只信任盘点仍可用且物理镜像
+确为完整的设备，不会把已改坏的旧镜像当成完好。盘点恢复后，同一实例可再次 `publish()`，
+一切以实际槽内容为准重新规划，不假定旧布局仍在。
+
+| 情况 | 结果 |
+| --- | --- |
+| 成功切换 | `publish()` 返回 `2` |
+| 无安全写入路径 | `NoSafeLayout`（零写入） |
+| 无设备持有当前整组镜像 | `NoReadyImage` |
+| 编程失败 | 原样抛出 `OSError`，版本保持 1 |
+| 非法配置 | `ValueError` |
+
 ## 测试与复现
 
 ```sh
@@ -583,6 +649,7 @@ python3 -m unittest -v test_offload.py
 python3 -m unittest -v test_receiving.py
 python3 -m unittest -v test_delivery_spool.py
 python3 -m unittest -v test_drill_review.py
+python3 -m unittest -v test_rollout.py
 python3 demo.py
 python3 demo_receive.py
 python3 demo_receive.py --spool /tmp/drill.spool && python3 demo_receive.py --read /tmp/drill.spool
@@ -740,3 +807,30 @@ python3 demo_receive.py --spool /tmp/drill.spool && python3 demo_receive.py --re
 这些值来自当次 `usage()`、`withdraw`/`sample`/`submit` 的真实返回与来源夹具的真实调用
 记录，而不是把测试预期当作实测打印。原有 `test_receiving.py` 与
 `test_delivery_spool.py` 回归保持通过。
+
+`test_rollout.py` 覆盖槽位发布的两条验收；预期新版本结果全部为测试中独立写出的
+字面量，模拟驱动只在内存里改槽并记录每次真实写入，不靠休眠、不开 socket：
+
+- 场景 1：A、B 各两槽且各含红蓝完整旧镜像，C 为空。仅 A、B 可用时，四条目标行虽
+  最终能放进 A、B，但切换途中无法同时保住两组旧版，`publish()` 抛 `NoSafeLayout`、
+  零物理写入、两组仍从 A 或 B 读到旧版；C 也可用时，逐槽写入的回调里实际查询红蓝
+  两组均得到版本 1，切换后两组的两个 `/25` 边界和未命中地址都得到准确的目标结果，
+  且未清理残留旧行；另有单槽设备需外部暂存、共享物理行无需重写、规划回溯等布局用例；
+- 场景 2：让驱动在第一笔真正破坏 A 或 B 上某组完整旧镜像的写入之后、返回之前真的
+  改了槽并抛 `OSError`，同时令该设备的 `inspect` 失败而 `lookup` 仍可用。断言
+  `publish()` 失败、故障点后无新编程请求、故障时与返回后两组仍为版本 1 且由确实
+  拥有完整镜像的设备作答；恢复盘点后用同一实例重试成功发布版本 2 并查到准确结果；
+- 另有构造校验（组数、组名、行数、前缀规范与唯一、动作/出口、设备与槽数、`eligible`
+  越界）与校验程序不读内存期望行、拒绝半份镜像/混入另一版额外行的覆盖。
+
+关键断言通过后，测试打印当次实际的拒绝、写入数、故障后仍可提供旧版查询的设备与
+重试后的查询结果，例如：
+
+```text
+[rollout scenario 1a observed] rejected=NoSafeLayout; physical_writes=0; old_read_banks=('A', 'A'); revision=1
+[rollout scenario 1b observed] physical_writes=4; writes=[...]; callback_old_banks=[('B', 'B'), ...]; new_reads_red=(('C', 'sent', 'red-low'), ('C', 'drop', None), ('C', 'punt', None)); ...
+[rollout scenario 2 observed] failed_write=(A,0) prior=('red', '198.51.100.0/24', 'sent', 'red-old'); programs_at_failure=1; revision_after_failure=1; old_read_banks_after_failure=('B', 'B'); revision_after_retry=2; retry_red=(('C', 'sent', 'red-low'), ('C', 'drop', None), ('C', 'punt', None)); ...
+```
+
+这些值来自当次 `publish()` 的返回值/异常、驱动实际记录的 `writes`/`programs` 及
+`resolve` 的真实返回，而不是把测试预期当作实测打印。
